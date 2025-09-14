@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Mabinso Passenger Count Viewer</title>
+<meta name="description" content="Visualize passenger counting data (VDV 457-2) on an interactive OSM map.">
+<link rel="icon" type="image/svg+xml" 
+      href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Ccircle%20cx%3D%2232%22%20cy%3D%2232%22%20r%3D%2230%22%20fill%3D%22%232d89ef%22/%3E%3Crect%20x%3D%2218%22%20y%3D%2218%22%20width%3D%2228%22%20height%3D%2228%22%20rx%3D%224%22%20ry%3D%224%22%20fill%3D%22white%22/%3E%3Ccircle%20cx%3D%2224%22%20cy%3D%2248%22%20r%3D%223%22%20fill%3D%22%232d89ef%22/%3E%3Ccircle%20cx%3D%2240%22%20cy%3D%2248%22%20r%3D%223%22%20fill%3D%22%232d89ef%22/%3E%3Crect%20x%3D%2222%22%20y%3D%2222%22%20width%3D%2220%22%20height%3D%228%22%20fill%3D%22%232d89ef%22/%3E%3C/svg%3E" />
+<link rel="icon" href="favicon.png" sizes="32x32" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>
+  html,body{height:100%;margin:0;font-family:Arial, sans-serif}
+  #controls{padding:6px;background:#f3f3f3;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  #filter-panel{padding:6px;background:#eee;display:flex;gap:8px;flex-wrap:wrap}
+#filter-panel-container {
+  display: flex;
+  flex-direction: column;
+}
+
+#filter-separator {
+  height: 6px;
+  background: #999;
+  cursor: row-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#toggle-filter {
+  background: #eee;
+  border: 1px solid #aaa;
+  border-radius: 4px;
+  padding: 0 6px;
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 12px;
+}
+
+  #content{display:flex;flex-direction:column;height:calc(100% - 110px)}
+  #map{height:50%}
+#splitter {
+  height: 14px;          /* slightly taller to fit arrow */
+  background: #999;
+  cursor: row-resize;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  user-select: none;
+}
+
+#splitter-arrow {
+  font-size: 14px;
+  color: white;
+  pointer-events: none;   /* click goes to splitter div */
+  transition: transform 0.2s ease;
+}
+  #table-container{flex:1;overflow:auto;position:relative;padding:6px;background:white}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th, td{border:1px solid #bbb;padding:4px;text-align:center}
+  thead th{position:sticky;top:0;background:#ddd;z-index:2}
+  tr.station-separator td {
+    /* thicker separator line */
+    border-top: 4px solid #D5D5D5; 
+  }
+  /* separator between POINT_INDEX values within same stop */
+  tr.pointindex-separator td {
+    border-top: 2px solid #007acc;   /* blue highlight */
+  }
+  .saldo-negative{color:red}
+  .saldo-warning{background:#FFDAB9 !important}
+  .selected-row{outline:2px solid #1a73e8;background:#dff0ff !important}
+  label.inline{display:inline-flex;align-items:center;gap:6px}
+  .filter-label{display:inline-flex;gap:4px;align-items:center;padding:2px 6px;background:#fff;border-radius:4px;border:1px solid #ccc}
+  .badge{display:inline-block;padding:2px 6px;border-radius:10px;font-size:11px;background:#eee;margin-left:4px}
+  #notifications{position:fixed;right:12px;top:12px;z-index:9999}
+  .toast{background:#333;color:#fff;padding:8px 12px;border-radius:6px;margin-bottom:8px;opacity:0.95}
+</style>
+</head>
+<body>
+  <div id="controls">
+    <input id="csv-file" type="file" accept=".csv" multiple />
+    <button id="load-sample">Load Sample CSV</button>
+    <label class="inline">Capacity:
+      <input id="capacity-input" type="number" value="50" min="1" style="width:72px"/>
+    </label>
+    <button id="export-csv">Export CSV</button>
+    <button id="select-all">Select All</button>
+    <button id="deselect-all">Deselect All</button>
+  </div>
+
+  <div id="filter-panel-container">
+    <div id="filter-panel" aria-label="Journey filters"></div>
+    <div id="filter-separator">
+	  <button id="toggle-filter" title="Hide/Show Journey Filter">⇅</button>
+    </div>
+  </div>
+
+  <div id="content">
+    <div id="map" role="application" aria-label="Map"></div>
+	<div id="splitter" title="Drag to resize map / table">
+	  <span id="splitter-arrow">⇅</span>
+	</div>
+    <div id="table-container" tabindex="0" aria-label="CSV Data Table"></div>
+  </div>
+  
+
+  <div id="notifications"></div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script>
+
+
+const Config = {
+  MAP: {
+    DEFAULT_CENTER: [52.52, 13.405],
+    DEFAULT_ZOOM: 12,
+  },
+  COLORS: {
+    DEFAULT: '#333',
+    NEGATIVE_SALDO: 'red',
+    WARNING_BG: '#ffe6e6',
+  },
+  API: {
+    OSRM: "https://router.project-osrm.org/route/v1",
+	OSM_TILES: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+  },
+};
+
+/* -------------------------
+   Utils
+   ------------------------- */
+class Utils {
+  static formatYyyymmdd(s) {
+    if (!s || s.length !== 8) return s || "";
+    const yyyy = s.substring(0, 4);
+    const mm = s.substring(4, 6);
+    const dd = s.substring(6, 8);
+    return `${dd}.${mm}.${yyyy}`;
+  }
+}
+/* -------------------------
+   NotificationService
+   ------------------------- */
+class NotificationService {
+  static toast(msg, timeout=5000){
+    const cont = document.getElementById('notifications');
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = msg;
+    cont.appendChild(el);
+    setTimeout(()=>{ el.remove(); }, timeout);
+  }
+  static error(msg){ alert(msg); }
+}
+
+/* -------------------------
+   CSVParser
+   - returns { data: rows[], headers: [...fields], errors: [...] }
+   ------------------------- */
+class CSVParser {
+  constructor(options={}) {
+    this.delimiter = options.delimiter || ';';
+    this.comment = options.comment || '#';
+    this.requiredHeaders = options.requiredHeaders || [];
+  }
+
+	/**
+	 * Parses multiple CSV files and merge rows into a single array.
+	 * @param {FileList | File[]} files - list of File objects from <input type="file" multiple>
+	 * @returns {Promise<Array> allRows} - resolves to merged rows array
+	 */
+	async parseFiles(files) {
+	  if (!files || !files.length) return { data: [], headers: this.requiredHeaders };
+
+	  const allRows = [];
+	  const fileArray = Array.from(files);
+
+	  const promises = fileArray.map((file, fileIdx) =>
+		this.parseFile(file).then(result =>
+		  result.data.map((r, rowIdx) => ({
+			...r,
+			__ORIG_FILE_IDX: fileIdx,
+			__ORIG_INDEX: rowIdx
+		  }))
+		)
+	  );
+
+	  try {
+		const results = await Promise.all(promises);
+		results.forEach(rows => allRows.push(...rows));
+	  } catch (err) {
+		console.error("Error parsing files:", err);
+	  }
+
+	  // sort by FAHRZEUG_NR, BETRIEBSTAG, then original file/index
+	  allRows.sort((a, b) => {
+		if (a.FAHRZEUG_NR !== b.FAHRZEUG_NR) return (a.FAHRZEUG_NR ?? '').localeCompare(b.FAHRZEUG_NR ?? '');
+		if (a.BETRIEBSTAG !== b.BETRIEBSTAG) return (a.BETRIEBSTAG ?? '').localeCompare(b.BETRIEBSTAG ?? '');
+		return (a.__ORIG_FILE_IDX ?? 0) - (b.__ORIG_FILE_IDX ?? 0) || (a.__ORIG_INDEX ?? 0) - (b.__ORIG_INDEX ?? 0);
+	  });
+
+	  return { data: allRows, headers: this.requiredHeaders };
+	}
+
+  parseFile(file){
+    return new Promise((resolve, reject) => {
+      Papa.parse(file, {
+        header: true,
+        delimiter: this.delimiter,
+        comments: this.comment,
+        skipEmptyLines: true,
+        dynamicTyping: false,
+        complete: (results) => {
+          const headers = results.meta && results.meta.fields ? results.meta.fields.slice() : [];
+          const missing = this.requiredHeaders.filter(h => !headers.includes(h));
+          const outcome = { data: results.data, headers, errors: results.errors || [] };
+          if (missing.length) {
+            reject(new Error('Missing headers: ' + missing.join(', ')));
+            return;
+          }
+          resolve(outcome);
+        },
+        error: (err) => reject(err)
+      });
+    });
+  }
+
+  parseText(text){
+    return new Promise((resolve, reject) => {
+      Papa.parse(text, {
+        header: true,
+        delimiter: this.delimiter,
+        comments: this.comment,
+        skipEmptyLines: true,
+        complete: (results) => {
+          const headers = results.meta && results.meta.fields ? results.meta.fields.slice() : [];
+          const missing = this.requiredHeaders.filter(h => !headers.includes(h));
+          const outcome = { data: results.data, headers, errors: results.errors || [] };
+          if (missing.length) {
+            reject(new Error('Missing headers: ' + missing.join(', ')));
+            return;
+          }
+          resolve(outcome);
+        },
+        error: (err) => reject(err)
+      });
+    });
+  }
+}
+
+/* -------------------------
+   AnomalyDetector
+   - pure-ish annotations of rows (adds/extends DATA_ANOMALY)
+   ------------------------- */
+class AnomalyDetector {
+  static isGpsUnknown(val) {
+    if (val === undefined || val === null) return true;
+    const s = String(val).trim();
+    if (s === '' || s === '0' || s === '0.0' || s === '.') return true;
+    // also treat non-numeric as unknown
+    return isNaN(Number(s));
+  }
+
+  detect(processedData, capacity) {
+    // processedData.allData are rows with computed SALDO and journey keys
+    processedData.allData.forEach((row, idx) => {
+      const anomalies = [];
+	  const prev = processedData.allData[idx - 1];
+	  
+  	  if (prev &&
+		  prev.__JOURNEY_KEY === row.__JOURNEY_KEY &&
+		  prev.HALT_NR === row.HALT_NR &&
+		  prev.POINT_INDEX !== row.POINT_INDEX
+	  ) {
+		// same journeystop, but POINT_INDEX changed
+		anomalies.push('Same stop, different GPS position');
+	  }
+      // GPS location unknown (per spec: empty or only '0' digit or '.')
+      const rawLon = (row['GPS_LON'] !== undefined) ? row['GPS_LON'] : row.GPS_LON;
+      const rawLat = (row['GPS_LAT'] !== undefined) ? row['GPS_LAT'] : row.GPS_LAT;
+      if (AnomalyDetector.isGpsUnknown(rawLon) || AnomalyDetector.isGpsUnknown(rawLat)) {
+        anomalies.push('GPS location unknown');
+      }
+
+      // negative Einsteiger/Aussteiger
+      const ein = parseInt(row['EINSTEIGER'] ?? row.EINSTEIGER ?? 0, 10) || 0;
+      const aus = parseInt(row['AUSSTEIGER'] ?? row.AUSSTEIGER ?? 0, 10) || 0;
+      if (ein < 0) anomalies.push('Negative Einsteiger');
+      if (aus < 0) anomalies.push('Negative Aussteiger');
+
+      // impossible saldo (<0)
+      const saldoVal = Number(row.SALDO) || 0;
+      if (saldoVal < 0) anomalies.push('Impossible Saldo');
+
+      // exceeding capacity: spec: Einsteiger or Aussteiger > capacity
+      if (Math.abs(ein) > capacity) anomalies.push('Exceeding capacity (Einsteiger)');
+      if (Math.abs(aus) > capacity) anomalies.push('Exceeding capacity (Aussteiger)');
+
+      row.DATA_ANOMALY = anomalies.join(', ');
+    });
+
+    // saldo drift: if journey end saldo !== 0, annotate last row of journey
+    for (const jk of processedData.journeyKeys) {
+      const journeyRows = processedData.allData.filter(r => r.__JOURNEY_KEY === jk);
+      if (journeyRows.length === 0) continue;
+      const last = journeyRows[journeyRows.length - 1];
+      const lastSaldo = Number(last.SALDO) || 0;
+      if (lastSaldo !== 0) {
+        last.DATA_ANOMALY = (last.DATA_ANOMALY ? last.DATA_ANOMALY + ', ' : '') + 'Saldo Drift';
+      }
+    }
+    return processedData;
+  }
+}
+
+/* -------------------------
+   DataProcessor
+   - compute POINT_INDEX, LFD_NR, SALDO
+   - maintain headers mapping via original keys
+   ------------------------- */
+class DataProcessor {
+  constructor() {}
+
+  _toNumberSafe(v) {
+    if (v === null || v === undefined || String(v).trim() === '') return NaN;
+    const n = Number(String(v).replace(',', '.'));
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  process(rows, headers) {
+    // rows: array of raw objects using original header names
+    // headers: original headers array
+    const allData = [];
+    const groupedPoints = {};
+    const journeyKeysSet = new Set();
+    const journeyColors = {};
+    const colors = ['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#46f0f0','#f032e6','#bcf60c','#fabebe'];
+    let colorIdx = 0;
+
+    // Normalize and add helper fields (preserve original keys)
+    rows.forEach((r, i) => {
+      // shallow copy to avoid mutating input
+      const row = Object.assign({}, r);
+      row.__ROW_ID = `r_${i}_${Math.random().toString(36).slice(2,8)}`;
+      // normalized quick-access fields for internal logic
+      row.LINIE = row['Linie'];
+      row.FAHRT_ID = row['Fahrt ID'];
+      row.__JOURNEY_KEY = `${row.FAHRZEUG_NR}|${row.BETRIEBSTAG}|${row.LINIE}|${row.FAHRT_ID}`;
+      // raw numeric conversions
+      row.GPS_LAT = this._toNumberSafe(row['GPS_LAT']);
+      row.GPS_LON = this._toNumberSafe(row['GPS_LON']);
+      row.EINSTEIGER = parseInt(row['EINSTEIGER'] ?? 0, 10) || 0;
+      row.AUSSTEIGER = parseInt(row['AUSSTEIGER'] ?? 0, 10) || 0;
+      row.HALT_NR = (row['Halt NR'] !== undefined && row['Halt NR'] !== '') ? row['Halt NR'] : row['Halt NR']; // keep as-is (string or number)
+      row.UHRZEIT_SEC = parseInt(row['UHRZEIT'] ?? 0, 10) || 0;
+      // human friendly time string
+      const hh = Math.floor(row.UHRZEIT_SEC / 3600).toString().padStart(2,'0');
+      const mm = Math.floor((row.UHRZEIT_SEC % 3600) / 60).toString().padStart(2,'0');
+      const ss = String(row.UHRZEIT_SEC % 60).padStart(2,'0');
+      row.HHMMSS = `${hh}:${mm}:${ss}`;
+
+      allData.push(row);
+    });
+	
+    // group by journey and sort by UHRZEIT (ascending)
+    const journeys = {};
+    allData.forEach(r => {
+      const jk = r.__JOURNEY_KEY;
+      if (!journeys[jk]) journeys[jk] = [];
+      journeys[jk].push(r);
+    });
+    Object.keys(journeys).forEach(jk => {
+      journeys[jk].sort((a,b) => (a.UHRZEIT_SEC || 0) - (b.UHRZEIT_SEC || 0));
+    });
+
+    // compute LFD_NR, POINT_INDEX, SALDO per journey
+    let previousJourneyFinalSaldo = 0; // carryover per spec unless negative
+    Object.keys(journeys).forEach((jk, jidx) => {
+      journeyKeysSet.add(jk);
+      journeyColors[jk] = colors[colorIdx++ % colors.length];
+      const seq = journeys[jk];
+      let lastHalt = null;
+      let lfd_nr = 0;
+      let lastLat = null, lastLon = null;
+      let pointIndex = 0;
+
+      // choose starting saldo: if previousJourneyFinalSaldo < 0, start 0; else start with previousJourneyFinalSaldo
+      let saldo = previousJourneyFinalSaldo < 0 ? 0 : previousJourneyFinalSaldo;
+
+      seq.forEach((r, idx) => {
+        // LFD_NR: increment when Halt NR changes compared to previous
+        if (idx === 0) {
+          lfd_nr = 1;
+          lastHalt = r.HALT_NR;
+        } else {
+          if (r.HALT_NR !== lastHalt) {
+            lfd_nr++;
+            lastHalt = r.HALT_NR;
+          }
+        }
+        r.LFD_NR = lfd_nr;
+
+        // POINT_INDEX: initialize 1, increment when GPS position changes from previous
+        // treat NaN lat/lon as change as well
+        const thisLat = Number.isFinite(r.GPS_LAT) ? r.GPS_LAT : null;
+        const thisLon = Number.isFinite(r.GPS_LON) ? r.GPS_LON : null;
+        if (idx === 0) {
+          pointIndex = 1;
+          lastLat = thisLat; lastLon = thisLon;
+        } else {
+          const changed = (thisLat !== lastLat) || (thisLon !== lastLon);
+          if (changed) pointIndex++;
+          lastLat = thisLat; lastLon = thisLon;
+        }
+        r.POINT_INDEX = pointIndex;
+
+        // SALDO
+        saldo = saldo + (Number(r.EINSTEIGER) || 0) - (Number(r.AUSSTEIGER) || 0);
+        r.SALDO = saldo;
+
+        // push into groupedPoints
+        const pointKey = `${r.__JOURNEY_KEY}|${r.POINT_INDEX}`;
+        if (!groupedPoints[pointKey]) groupedPoints[pointKey] = [];
+        groupedPoints[pointKey].push(r);
+      });
+
+      // after journey done set previousJourneyFinalSaldo
+      previousJourneyFinalSaldo = seq.length ? (Number(seq[seq.length-1].SALDO) || 0) : previousJourneyFinalSaldo;
+    });
+
+    return {
+      allData,
+      groupedPoints,
+      journeyKeys: Array.from(journeyKeysSet),
+      journeyColors,
+      headersOriginal: headers || []
+    };
+  }
+}
+
+/* -------------------------
+   MapRenderer (Leaflet)
+   - render markers and polylines
+   - safe tooltip content (DOM nodes)
+   - highlight and focus by row id
+   ------------------------- */
+class MapRenderer {
+  constructor(containerId) {
+    this.map = L.map(containerId).setView(Config.MAP.DEFAULT_CENTER, Config.MAP.DEFAULT_ZOOM);
+    L.tileLayer(Config.API.OSM_TILES, { maxZoom: 19 }).addTo(this.map);
+    
+    this.markers = {};       // pointKey -> marker
+    this.markerJourney = {}; // pointKey -> journeyKey
+    this.polylines = {};     // journeyKey -> polyline
+    this.onMarkerClick = null;
+  }
+
+  _escapeText(s) {
+    return String(s === undefined || s === null ? '' : s);
+  }
+
+  _buildTooltipElement(rows) {
+    const table = document.createElement('table');
+    table.style.borderCollapse = 'collapse';
+    table.style.fontSize = '11px';
+    const thead = document.createElement('thead');
+    const trh = document.createElement('tr');
+    ['UHRZEIT','LFD_NR','Halt NR','TUER_ID','EINSTEIGER','AUSSTEIGER','SALDO'].forEach(t => {
+      const th = document.createElement('th');
+      th.textContent = t;
+      th.style.border = '1px solid #ccc';
+      th.style.padding = '2px 4px';
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach(r => {
+      const tr = document.createElement('tr');
+      [r.HHMMSS, r.LFD_NR, r['Halt NR'] ?? r.HALT_NR, r['TUER_ID'] ?? r.TUER_ID, r.EINSTEIGER, r.AUSSTEIGER, r.SALDO].forEach(val => {
+        const td = document.createElement('td');
+        td.textContent = this._escapeText(val);
+        td.style.border = '1px solid #eee';
+        td.style.padding = '2px 4px';
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    return table;
+  }
+  
+	async routePolyline(latlngs, osmProfile='driving') {
+		if (latlngs.length < 2) return latlngs;
+
+		const profile = osmProfile; // OSRM doesn't have bus, driving is closest
+
+		const coords = latlngs.map(p => `${p[1]},${p[0]}`).join(';'); // lon,lat
+		const url = `${Config.API.OSRM}/${profile}/${coords}?geometries=geojson&overview=full`;
+
+		const resp = await fetch(url);
+		if (!resp.ok) return latlngs;
+
+		const data = await resp.json();
+		if (data.routes && data.routes.length > 0) {
+			return data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]); // back to lat,lng
+		}
+		return latlngs;
+	}
+
+
+  async render(processedData, onMarkerClick = null) {
+    this.onMarkerClick = onMarkerClick;
+    // remove existing layers
+    for (const mk in this.markers) {
+      try { this.map.removeLayer(this.markers[mk]); } catch (e) {}
+    }
+    for (const pl in this.polylines) {
+      try { this.map.removeLayer(this.polylines[pl]); } catch (e) {}
+    }
+    this.markers = {}; this.markerJourney = {}; this.polylines = {};
+
+    // render markers for groupedPoints
+    for (const pointKey in processedData.groupedPoints) {
+      const rows = processedData.groupedPoints[pointKey];
+      if (!rows || !rows.length) continue;
+      const first = rows[0];
+      // skip markers for unknown coords
+      if (!(Number.isFinite(first.GPS_LAT) && Number.isFinite(first.GPS_LON))) continue;
+      const journeyKey = `${first.__JOURNEY_KEY}`;
+      const color = processedData.journeyColors[journeyKey] || Config.COLORS.DEFAULT;
+      const iconHtml = `<div aria-hidden="true" style="
+          width:28px;height:28px;line-height:28px;border-radius:50%;
+          background:${color};color:white;text-align:center;border:1px solid #000">
+            ${this._escapeText(first.POINT_INDEX)}
+          </div>`;
+      const marker = L.marker([first.GPS_LAT, first.GPS_LON], {
+        icon: L.divIcon({ html: iconHtml, className: '' })
+      }).addTo(this.map);
+
+      const tooltipEl = this._buildTooltipElement(rows);
+      marker.bindTooltip(tooltipEl, { direction: 'top', sticky: true });
+
+      // click => emit row id of first row
+      marker.on('click', () => {
+        if (this.onMarkerClick) this.onMarkerClick(rows[0].__ROW_ID);
+      });
+
+      this.markers[pointKey] = marker;
+      this.markerJourney[pointKey] = journeyKey;
+    }
+
+    // --- draw polylines per journey in parallel ---
+    const journeyPromises = processedData.journeyKeys.map(async jk => {
+      const rows = processedData.allData.filter(r => r.__JOURNEY_KEY === jk && Number.isFinite(r.GPS_LAT) && Number.isFinite(r.GPS_LON));
+      if (!rows.length) return null;
+      rows.sort((a,b) => (a.UHRZEIT_SEC - b.UHRZEIT_SEC) || (a.POINT_INDEX - b.POINT_INDEX));
+      const latlngs = rows.map(r => [r.GPS_LAT, r.GPS_LON]);
+      const color = processedData.journeyColors[jk] || Config.COLORS.DEFAULT;
+
+      let snappedLatLngs = latlngs;
+      try {
+        snappedLatLngs = await this.routePolyline(latlngs);
+      } catch (err) {
+        console.warn("Routing failed, fallback to raw GPS", err);
+      }
+
+      const poly = L.polyline(snappedLatLngs, { color, weight: 3 }).addTo(this.map);
+
+      const first = rows[0], last = rows[rows.length - 1];
+      const tip = document.createElement('div');
+      tip.innerHTML = `
+        <div style="font-weight:bold">
+          ${this._escapeText(first.LINIE)} | ${this._escapeText(first.FAHRT_ID)}
+        </div>
+        <div>
+          Fahrzeug: ${this._escapeText(first.FAHRZEUG_NR)} | Betriebstag: ${Utils.formatYyyymmdd(first.BETRIEBSTAG)}
+        </div>
+        <div>
+          ${this._escapeText(first.HHMMSS)} → ${this._escapeText(last.HHMMSS)}
+        </div>
+        <div>
+          Saldo: ${this._escapeText(first.SALDO)} → ${this._escapeText(last.SALDO)}
+        </div>
+      `;
+      poly.bindTooltip(tip);
+      this.polylines[jk] = poly;
+      return poly;
+    });
+
+    await Promise.all(journeyPromises.filter(Boolean));
+
+    // Auto-fit bounds to all polylines
+    const allLatLngs = [];
+    Object.values(this.polylines).forEach(poly => {
+      allLatLngs.push(...poly.getLatLngs());
+    });
+    if (allLatLngs.length) {
+      const bounds = L.latLngBounds(allLatLngs);
+      this.map.fitBounds(bounds, { padding: [30, 30] });
+    } else {
+      this.map.setView(Config.MAP.DEFAULT_CENTER, Config.MAP.DEFAULT_ZOOM);
+    }
+	 
+  }
+
+  setJourneyVisibility(jKey, visible) {
+    // toggle polyline
+    const poly = this.polylines[jKey];
+    if (poly) {
+      visible ? poly.addTo(this.map) : this.map.removeLayer(poly);
+    }
+    // toggle markers belonging to journey
+    for (const pointKey in this.markerJourney) {
+      if (this.markerJourney[pointKey] === jKey && this.markers[pointKey]) {
+        visible ? this.markers[pointKey].addTo(this.map) : this.map.removeLayer(this.markers[pointKey]);
+      }
+    }
+  }
+
+  focusOnPointByRowId(rowId) {
+    // find marker that contains a row with this rowId (we store markers by grouped point; need to match)
+    for (const pointKey in this.markers) {
+      const marker = this.markers[pointKey];
+      const rows = pointKey.split('|'); // not used here
+      // we attached click to open tooltip based on row id; but we need to find which groupedPoints includes it
+      // MapRenderer does not have groupedPoints stored here; higher level will call highlightMarker with row object - so we expect AppController to keep mapping
+    }
+  }
+
+  highlightMarkerForRow(row, processedData) {
+    // given a row object, compute pointKey and open tooltip and set view
+    const pointKey = `${row.__JOURNEY_KEY}|${row.POINT_INDEX}`;
+    const marker = this.markers[pointKey];
+    if (marker) {
+      marker.openTooltip();
+      this.map.setView(marker.getLatLng(), 15);
+    } else {
+      // if marker not present (e.g., missing coords), do nothing
+    }
+  }
+
+	focusOnJourneyFirstPoint(jKey, processedData) {
+		// find first grouped point for journey and open it
+		for (const pk in processedData.groupedPoints) {
+			if (pk.startsWith(jKey + '|')) {
+				const marker = this.markers[pk];
+				if (marker) {
+					marker.openTooltip();
+					// directly set view on the marker
+					this.map.setView(marker.getLatLng(), 14);
+				}
+				break;
+			}
+		}
+	}
+}
+
+/* -------------------------
+   TableRenderer
+   - uses original headers (exact strings)
+   - appends computed columns: LFD_NR, SALDO, DATA_ANOMALY
+   - selectRowById
+   ------------------------- */
+class TableRenderer {
+  constructor(containerId, onRowClick=null) {
+    this.container = document.getElementById(containerId);
+    this.onRowClick = onRowClick;
+    this.allData = [];
+    this.headers = [];
+    this.rowElements = [];
+    this.selectedRowId = null;
+    this.container.addEventListener('keydown', e => this._onKeyDown(e));
+  }
+
+  _onKeyDown(e) {
+    if (!this.rowElements.length) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); this._moveSelection(1); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); this._moveSelection(-1); }
+  }
+
+  _moveSelection(offset) {
+    const visibleRows = this.rowElements.filter(tr => tr.style.display !== 'none');
+    if (!visibleRows.length) return;
+    let idx = visibleRows.findIndex(tr => tr.dataset.rowid === this.selectedRowId);
+    if (idx === -1) idx = offset > 0 ? -1 : 0;
+    let newIdx = idx + offset;
+    if (newIdx < 0 || newIdx >= visibleRows.length) return;
+    const tr = visibleRows[newIdx];
+    const rowId = tr.dataset.rowid;
+    const rowIndex = this.allData.findIndex(r => r.__ROW_ID === rowId);
+    if (rowIndex >= 0) this.selectRowByIndex(rowIndex);
+  }
+
+  render(headers, rows, processedData) {
+    this.processedData = processedData; // store for JOURNEY_COLOR column
+    this.headers = headers.slice();
+    this.allData = rows.slice();
+    this.rowElements = [];
+    this.selectedRowId = null;
+
+    // append computed columns if not present
+    const displayHeaders = this.headers.slice();
+	if (!displayHeaders.includes('-')) displayHeaders.push('-');
+    if (!displayHeaders.includes('LFD_NR')) displayHeaders.push('LFD_NR');
+    if (!displayHeaders.includes('SALDO')) displayHeaders.push('SALDO');
+    if (!displayHeaders.includes('Anomaly')) displayHeaders.push('Anomaly');
+
+	// move "SALDO" column first
+	const idx = displayHeaders.indexOf('-');
+	if (idx > -1) {
+	  displayHeaders.splice(idx, 1);   // remove from current position
+	  displayHeaders.unshift('-'); // insert at start
+	}
+    // build table
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const trh = document.createElement('tr');
+    displayHeaders.forEach(h => {
+      const th = document.createElement('th');
+      th.textContent = h;
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    const fragment = document.createDocumentFragment();
+
+    // compute journey alternation
+    const journeyOrder = [];
+    rows.forEach(r => {
+      const jk = `${r.__JOURNEY_KEY}`;
+      if (!journeyOrder.includes(jk)) journeyOrder.push(jk);
+    });
+
+	this.journeyRowMap = new Map();
+    rows.forEach((r, idx) => {
+      const tr = document.createElement('tr');
+    
+	  // Compare with previous row
+	  const prev = rows[idx - 1];
+	  if (prev) {
+		  if (prev.__JOURNEY_KEY == r.__JOURNEY_KEY &&
+			  prev.HALT_NR !== r.HALT_NR) {
+			// completely new journey or stop
+			tr.classList.add("station-separator");
+		  } else if (
+			  prev.__JOURNEY_KEY === r.__JOURNEY_KEY &&
+			  prev.HALT_NR === r.HALT_NR &&
+			  prev.POINT_INDEX !== r.POINT_INDEX
+		  ) {
+			// same journeystop, but POINT_INDEX changed
+			tr.classList.add("pointindex-separator");
+		  }
+	  }
+      tr.dataset.rowid = r.__ROW_ID;
+      tr.dataset.journey = `${r.__JOURNEY_KEY}`;
+      tr.style.backgroundColor = (journeyOrder.indexOf(tr.dataset.journey) % 2 === 0) ? 'white' : '#f0f0f0';
+      tr.addEventListener('click', () => {
+        this.selectRowByIndex(idx);
+      });
+
+      // fill columns
+      displayHeaders.forEach(h => {
+        const td = document.createElement('td');
+        // computed cols
+        if (h === 'LFD_NR') td.textContent = r.LFD_NR ?? '';
+        else if (h === 'SALDO') {
+          td.textContent = (r.SALDO !== undefined) ? String(r.SALDO) : '';
+          if (Number(r.SALDO) < 0) td.classList.add('saldo-negative');
+          // if this is last row of journey and saldo != 0 -> warning background
+          const journeyRows = rows.filter(x => `${x.__JOURNEY_KEY}` === tr.dataset.journey);
+          if (journeyRows[journeyRows.length-1] === r && Number(r.SALDO) !== 0) {
+            td.classList.add('saldo-warning');
+          }
+        } else if (h === 'Anomaly') {
+          td.textContent = r.DATA_ANOMALY ?? '';
+        } else {
+		  let val = r[h];
+		  if (h === 'BETRIEBSTAG' || h === 'DATUM') {
+			val = Utils.formatYyyymmdd(r[h]);
+		  } else if (h === 'UHRZEIT') {
+			val = r['HHMMSS'];
+		  } else if (h === '-') {
+			  const color = processedData.journeyColors ? processedData.journeyColors[r.__JOURNEY_KEY] : Config.COLORS.DEFAULT;
+			  const div = document.createElement('div');
+			  div.style.width = '16px';
+			  div.style.height = '16px';
+			  div.style.margin = '0 auto';
+			  div.style.borderRadius = '50%';
+			  div.style.backgroundColor = color;
+			  td.appendChild(div);
+ 		  } else {
+			  td.textContent = (val !== undefined) ? val : '';
+    	  }
+
+        }
+        td.style.whiteSpace = 'nowrap';
+        tr.appendChild(td);
+      });
+
+      tbody.appendChild(tr);
+
+      // Build journeyRowMap for fast filtering
+      const jk = r.__JOURNEY_KEY;
+	  if (!this.journeyRowMap.has(jk)) this.journeyRowMap.set(jk, []);
+      this.journeyRowMap.get(jk).push(tr);
+      this.rowElements.push(tr);
+    });
+
+    tbody.appendChild(fragment);
+    table.appendChild(tbody);
+    this.container.innerHTML = '';
+    this.container.appendChild(table);
+  }
+
+  selectRowByIndex(idx) {
+    const row = this.allData[idx];
+    if (!row) return;
+    this.rowElements.forEach(tr => tr.classList.remove('selected-row'));
+    const tr = this.rowElements.find(t => t.dataset.rowid === row.__ROW_ID);
+    if (tr) {
+      tr.classList.add('selected-row');
+      tr.scrollIntoView({behavior:'smooth', block:'center'});
+    }
+    this.selectedRowId = row.__ROW_ID;
+    if (this.onRowClick) this.onRowClick(row);
+  }
+
+  selectRowById(rowId) {
+    const idx = this.allData.findIndex(r => r.__ROW_ID === rowId);
+    if (idx >= 0) this.selectRowByIndex(idx);
+  }
+
+  filterByJourneys(jKeys) {
+    // hide all rows
+    this.rowElements.forEach(tr => tr.style.display = 'none');
+    // show only selected journeys
+    jKeys.forEach(jk => {
+      const list = this.journeyRowMap.get(jk) || [];
+      list.forEach(tr => tr.style.display = '');
+    });
+  }
+}
+
+/* -------------------------
+   FilterPanel
+   - uses cb.dataset.journey for robust mapping
+   ------------------------- */
+class FilterPanel {
+  constructor(containerId, onChange) {
+    this.container = document.getElementById(containerId);
+    this.onChange = onChange;
+  }
+
+  render(journeyKeys) {
+    this.container.innerHTML = "";
+    // group journey keys by vehicle
+    const grouped = {};
+    journeyKeys.forEach(jk => {
+      const [fahrzeug, betriebstag, linie, fahrt] = jk.split("|");
+      grouped[fahrzeug] ||= [];
+      grouped[fahrzeug].push({ jk, betriebstag, linie, fahrt });
+    });
+
+    Object.keys(grouped).forEach(vehicle => {
+      // create a container for each vehicle group
+      const vehicleGroup = document.createElement('div');
+      vehicleGroup.style.display = 'flex';
+      vehicleGroup.style.flexWrap = 'wrap';
+      vehicleGroup.style.marginBottom = '6px'; // spacing between vehicles
+
+      // optional: vehicle label as header
+      const header = document.createElement("div");
+      header.style.fontWeight = "bold";
+      header.style.width = '100%'; // force new line
+      header.textContent = `Fahrzeug ${vehicle}`;
+      vehicleGroup.appendChild(header);
+
+      grouped[vehicle].forEach(j => {
+        const label = document.createElement("label");
+        label.className = 'filter-label';
+        label.style.marginRight = '6px';
+        label.style.marginBottom = '4px';
+
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = true;
+        cb.dataset.journey = j.jk;
+        cb.addEventListener('change', () => this.onChange(this.getSelectedKeys()));
+
+        const span = document.createElement("span");
+        span.textContent = `${j.linie} | ${j.fahrt} (${Utils.formatYyyymmdd(j.betriebstag)})`;
+
+        label.appendChild(cb);
+        label.appendChild(span);
+        vehicleGroup.appendChild(label);
+      });
+
+      this.container.appendChild(vehicleGroup);
+    });
+  }
+  
+  getSelectedKeys() {
+    return Array.from(this.container.querySelectorAll('input[type=checkbox]')).filter(cb => cb.checked).map(cb => cb.dataset.journey);
+  }
+
+  setAll(checked) {
+    this.container.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = checked);
+    this.onChange(this.getSelectedKeys());
+  }
+}
+
+/* -------------------------
+   AppController - wires components
+   ------------------------- */
+class AppController {
+  constructor() {
+    this.parser = new CSVParser({
+      requiredHeaders: [
+        'FAHRZEUG_NR','DATUM','BETRIEBSTAG','UHRZEIT','GPS_LON','GPS_LAT',
+        'Vehicle type','Linie','Fahrt ID','Halt NR','Number of Doors','TUER_ID','SENSOR_STATUS','EINSTEIGER','AUSSTEIGER'
+      ]
+    });
+    this.processor = new DataProcessor();
+    this.anomalyDetector = new AnomalyDetector();
+    this.mapRenderer = new MapRenderer('map');
+    this.tableRenderer = new TableRenderer('table-container', row => this.onRowClick(row));
+    this.filterPanel = new FilterPanel('filter-panel', keys => this.onFilterChange(keys));
+    this.data = null;
+    this.silent = false;
+    this.bindUI();
+  }
+
+  bindUI() {
+    document.getElementById('csv-file').addEventListener('change', e => {
+       this.loadFiles(e.target.files);
+    });
+    document.getElementById('load-sample').addEventListener('click', () => this.loadSample());
+    document.getElementById('export-csv').addEventListener('click', () => this.exportCSV());
+    document.getElementById('select-all').addEventListener('click', () => {
+      this.filterPanel.setAll(true);
+    });
+    document.getElementById('deselect-all').addEventListener('click', () => {
+      this.filterPanel.setAll(false);
+    });
+
+	const filterPanelContainer = document.getElementById('filter-panel-container');
+	const filterPanel = document.getElementById('filter-panel');
+	const filterSeparator = document.getElementById('filter-separator');
+	const content = document.getElementById('content');
+	const mapDiv = document.getElementById('map');
+	const tableDiv = document.getElementById('table-container');
+	let draggingFilter = false;
+
+	// Drag to resize
+	filterSeparator.addEventListener('mousedown', () => draggingFilter = true);
+	document.addEventListener('mouseup', () => draggingFilter = false);
+	document.addEventListener('mousemove', e => {
+	  if (!draggingFilter) return;
+	  const rect = filterPanelContainer.getBoundingClientRect();
+	  let newHeight = e.clientY - rect.top;
+	  if (newHeight < 50) newHeight = 50;
+	  if (newHeight > 500) newHeight = 500; // optional max height
+	  filterPanel.style.height = newHeight + 'px';
+	  mapDiv.style.height = (content.clientHeight - newHeight - 6) + 'px';
+	  try { window.app.mapRenderer.map.invalidateSize(); } catch(e){}
+	});
+
+	// Toggle hide/show
+	document.getElementById('toggle-filter').addEventListener('click', () => {
+	  if (filterPanel.style.display === 'none') {
+		filterPanel.style.display = 'flex';
+		filterSeparator.style.height = '6px';
+		filterSeparator.style.transform = 'rotate(0deg)';
+	  } else {
+		filterPanel.style.display = 'none';
+		filterSeparator.style.height = '20px'; // keep toggle button visible
+		filterSeparator.style.transform = 'rotate(180deg)';
+	  }
+	  try { window.app.mapRenderer.map.invalidateSize(); } catch(e){}
+	});
+
+	const splitter = document.getElementById('splitter');
+	const splitterArrow = document.getElementById('splitter-arrow');
+	let dragging = false;
+
+	splitter.addEventListener('mousedown', () => dragging = true);
+	document.addEventListener('mouseup', () => dragging = false);
+	document.addEventListener('mousemove', e => {
+	  if (!dragging) return;
+	  const rect = content.getBoundingClientRect();
+	  let mapHeight = e.clientY - rect.top;
+	  if (mapHeight < 100) mapHeight = 100;
+	  if (mapHeight > rect.height - 100) mapHeight = rect.height - 100;
+	  mapDiv.style.height = mapHeight + 'px';
+	  tableDiv.style.height = (rect.height - mapHeight - 6) + 'px';
+	  try { window.app.mapRenderer.map.invalidateSize(); } catch(e){}
+	});
+
+	let lastTableSize = 120;
+	// Toggle table hide/show on click
+	splitter.addEventListener('click', () => {
+	  if (tableDiv.style.display === 'none') {
+		tableDiv.style.display = 'block';
+		tableDiv.style.height = lastTableSize + 'px';
+		mapDiv.style.display = 'block';
+		
+		const rect = content.getBoundingClientRect();
+		const mapHeight = rect.height - lastTableSize;
+		mapDiv.style.height = mapHeight + 'px';
+		splitterArrow.style.transform = 'rotate(0deg)'; 
+		splitterArrow.style.height = '6px';
+	  } else {
+	    lastTableSize = tableDiv.getBoundingClientRect().height;
+		tableDiv.style.height = '0px';
+		tableDiv.style.display = 'none';
+		const rect = content.getBoundingClientRect();;
+		mapDiv.style.height = rect.height + 'px';
+		mapDiv.style.display = 'flex';
+		splitterArrow.style.transform = 'rotate(180deg)';
+		splitterArrow.style.height = '20px'; // keep toggle button visible
+	  }
+	  try { window.app.mapRenderer.map.invalidateSize(); } catch(e){}
+	});
+
+  }
+
+
+  loadFiles(files) {
+    this.parser.parseFiles(files).then(result => {
+      // store original headers
+      const parsed = result;
+      this.processAndRender(parsed.data, parsed.headers);
+      if (parsed.errors && parsed.errors.length) {
+        NotificationService.toast('Parse warnings: ' + parsed.errors.length + ' issues (see console)');
+        console.warn('CSV parse errors/warnings:', parsed.errors);
+      }
+    }).catch(err => {
+      NotificationService.error(err.message || String(err));
+    });
+  }
+
+  loadSample() {
+    const text = `# example
+FAHRZEUG_NR;DATUM;BETRIEBSTAG;UHRZEIT;GPS_LON;GPS_LAT;Vehicle type;Linie;Fahrt ID;Halt NR;Number of Doors;TUER_ID;SENSOR_STATUS;EINSTEIGER;AUSSTEIGER
+1001;20250911;1;0;13.405;52.52;Bus;10;100;1;2;1;OK;5;0
+1001;20250911;1;300;13.406;52.521;Bus;10;100;2;2;1;OK;3;1
+1002;20250911;1;0;13.407;52.522;Bus;20;200;1;2;1;OK;2;0
+1002;20250911;1;120;0;0;Bus;20;200;1;2;1;OK;1;1
+`;
+    this.parser.parseText(text).then(parsed => {
+      this.processAndRender(parsed.data, parsed.headers);
+    }).catch(err => NotificationService.error(err.message || String(err)));
+  }
+
+  processAndRender(rows, headers) {
+    // rows: raw parsed data array, headers: original header names array
+    const processed = this.processor.process(rows, headers);
+    // store header info
+    this.data = processed;
+    this.data.headersOriginal = headers.slice();
+
+    // run anomalies (capacity from UI)
+    const capacity = Number(document.getElementById('capacity-input').value) || 50;
+    this.anomalyDetector.detect(this.data, capacity);
+
+    // Render table with original headers + computed columns
+    const tableHeaders = this.data.headersOriginal.slice();
+
+    this.tableRenderer.render(tableHeaders, this.data.allData, this.data); 
+    this.mapRenderer.render(this.data, rowId => this.onMarkerClick(rowId));
+    this.filterPanel.render(this.data.journeyKeys);
+  }
+
+  onFilterChange(selectedKeys) {
+    if (!this.data) return;
+    this.data.journeyKeys.forEach(jk => {
+      this.mapRenderer.setJourneyVisibility(jk, selectedKeys.includes(jk));
+    });
+    this.tableRenderer.filterByJourneys(selectedKeys);
+    // focus on first journey if a single journey was chosen or first selected
+    if (selectedKeys.length > 0) {
+      const firstJK = selectedKeys[0];
+      this.mapRenderer.focusOnJourneyFirstPoint(firstJK, this.data);
+    }
+  }
+
+  onMarkerClick(rowId) {
+    // robust select by __ROW_ID
+    this.tableRenderer.selectRowById(rowId);
+  }
+
+  onRowClick(row) {
+    // row is the row object from allData
+    this.mapRenderer.highlightMarkerForRow(row, this.data);
+  }
+
+  exportCSV() {
+    if (!this.data || !this.data.allData) return NotificationService.toast('No data to export');
+    const originalHeaders = this.data.headersOriginal.slice();
+    const outHeaders = originalHeaders.slice();
+    if (!outHeaders.includes('LFD_NR')) outHeaders.push('LFD_NR');
+    if (!outHeaders.includes('SALDO')) outHeaders.push('SALDO');
+    if (!outHeaders.includes('DATA_ANOMALY')) outHeaders.push('DATA_ANOMALY');
+
+    // create rows in header order
+    const outRows = this.data.allData.map(r => {
+      const rowArr = outHeaders.map(h => {
+        if (h === 'LFD_NR') return r.LFD_NR ?? '';
+        if (h === 'SALDO') return r.SALDO ?? '';
+        if (h === 'DATA_ANOMALY') return r.DATA_ANOMALY ?? '';
+        return (r[h] !== undefined && r[h] !== null) ? String(r[h]) : '';
+      });
+      return rowArr;
+    });
+
+    // use Papa.unparse with objects: build array of objects preserving header order
+    const csv = Papa.unparse({
+      fields: outHeaders,
+      data: outRows
+    });
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'export.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    NotificationService.toast('CSV exported');
+  }
+}
+
+/* -------------------------
+   bootstrap
+   ------------------------- */
+window.addEventListener('DOMContentLoaded', () => {
+  window.app = new AppController();
+});
+  </script>
+</body>
+</html>
