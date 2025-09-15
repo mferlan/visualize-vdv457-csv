@@ -454,6 +454,12 @@ class MapRenderer {
     this.markerJourney = {}; // pointKey -> journeyKey
     this.polylines = {};     // journeyKey -> polyline
     this.onMarkerClick = null;
+   this.routeCache = new Map(); // cache for route results
+  }
+
+  // --- helper to generate a cache key for a journey ---
+  _routeCacheKey(latlngs, profile) {
+    return `${profile}:${latlngs.map(p => p.join(',')).join('|')}`;
   }
 
   _escapeText(s) {
@@ -491,23 +497,47 @@ class MapRenderer {
     return table;
   }
   
-	async routePolyline(latlngs, osmProfile='driving') {
-		if (latlngs.length < 2) return latlngs;
+  // --- fetch route from OSRM with retry and caching ---
+  async routePolyline(latlngs, osmProfile='driving', retries=3, delayMs=500) {
+    if (latlngs.length < 2) return latlngs;
 
-		const profile = osmProfile; // OSRM doesn't have bus, driving is closest
+    const profile = osmProfile;
+    const cacheKey = this._routeCacheKey(latlngs, profile);
 
-		const coords = latlngs.map(p => `${p[1]},${p[0]}`).join(';'); // lon,lat
-		const url = `${Config.API.OSRM}/${profile}/${coords}?geometries=geojson&overview=full`;
+    // check cache first
+    if (this.routeCache.has(cacheKey)) {
+      return this.routeCache.get(cacheKey);
+    }
 
-		const resp = await fetch(url);
-		if (!resp.ok) return latlngs;
+    const coords = latlngs.map(p => `${p[1]},${p[0]}`).join(';'); // lon,lat
+    const url = `${Config.API.OSRM}/${profile}/${coords}?geometries=geojson&overview=full`;
 
-		const data = await resp.json();
-		if (data.routes && data.routes.length > 0) {
-			return data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]); // back to lat,lng
-		}
-		return latlngs;
-	}
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (data.routes && data.routes.length > 0) {
+          const snapped = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]); // lat,lng
+          this.routeCache.set(cacheKey, snapped); // cache result
+          return snapped;
+        }
+        // fallback if no routes
+        break;
+      } catch (err) {
+        console.warn(`OSRM request failed (attempt ${attempt + 1}):`, err);
+        if (attempt < retries) {
+          await new Promise(r => setTimeout(r, delayMs * Math.pow(2, attempt))); // exponential backoff
+        } else {
+          break;
+        }
+      }
+    }
+
+    // fallback: return raw latlngs if all retries fail
+    return latlngs;
+  }
+
 
 
   async render(processedData, onMarkerClick = null) {
@@ -550,46 +580,53 @@ class MapRenderer {
       this.markers[pointKey] = marker;
       this.markerJourney[pointKey] = journeyKey;
     }
+	
+	  // --- draw polylines per journey with concurrency limit ---
+	  const concurrency = 5; // max OSRM requests at the same time
+	  const journeyKeys = processedData.journeyKeys;
+	  const allPolylines = [];
 
-    // --- draw polylines per journey in parallel ---
-    const journeyPromises = processedData.journeyKeys.map(async jk => {
-      const rows = processedData.allData.filter(r => r.__JOURNEY_KEY === jk && Number.isFinite(r.GPS_LAT) && Number.isFinite(r.GPS_LON));
-      if (!rows.length) return null;
-      rows.sort((a,b) => (a.UHRZEIT_SEC - b.UHRZEIT_SEC) || (a.POINT_INDEX - b.POINT_INDEX));
-      const latlngs = rows.map(r => [r.GPS_LAT, r.GPS_LON]);
-      const color = processedData.journeyColors[jk] || Config.COLORS.DEFAULT;
+	  for (let i = 0; i < journeyKeys.length; i += concurrency) {
+		const batchKeys = journeyKeys.slice(i, i + concurrency);
+		const batchPromises = batchKeys.map(async jk => {
+		  const rows = processedData.allData
+			.filter(r => r.__JOURNEY_KEY === jk && Number.isFinite(r.GPS_LAT) && Number.isFinite(r.GPS_LON));
+		  if (!rows.length) return null;
+		  rows.sort((a,b) => (a.UHRZEIT_SEC - b.UHRZEIT_SEC) || (a.POINT_INDEX - b.POINT_INDEX));
+		  const latlngs = rows.map(r => [r.GPS_LAT, r.GPS_LON]);
+		  const color = processedData.journeyColors[jk] || Config.COLORS.DEFAULT;
 
-      let snappedLatLngs = latlngs;
-      try {
-        snappedLatLngs = await this.routePolyline(latlngs);
-      } catch (err) {
-        console.warn("Routing failed, fallback to raw GPS", err);
-      }
+		  let snappedLatLngs = latlngs;
+		  try {
+			snappedLatLngs = await this.routePolyline(latlngs);
+		  } catch (err) {
+			console.warn("Routing failed, fallback to raw GPS", err);
+		  }
 
-      const poly = L.polyline(snappedLatLngs, { color, weight: 3 }).addTo(this.map);
-
-      const first = rows[0], last = rows[rows.length - 1];
-      const tip = document.createElement('div');
-      tip.innerHTML = `
-        <div style="font-weight:bold">
-          ${this._escapeText(first.LINIE)} | ${this._escapeText(first.FAHRT_ID)}
-        </div>
-        <div>
-          Fahrzeug: ${this._escapeText(first.FAHRZEUG_NR)} | Betriebstag: ${Utils.formatYyyymmdd(first.BETRIEBSTAG)}
-        </div>
-        <div>
-          ${this._escapeText(first.HHMMSS)} → ${this._escapeText(last.HHMMSS)}
-        </div>
-        <div>
-          Saldo: ${this._escapeText(first.SALDO)} → ${this._escapeText(last.SALDO)}
-        </div>
-      `;
-      poly.bindTooltip(tip);
-      this.polylines[jk] = poly;
-      return poly;
-    });
-
-    await Promise.all(journeyPromises.filter(Boolean));
+		  const poly = L.polyline(snappedLatLngs, { color, weight: 3 }).addTo(this.map);
+		  const first = rows[0], last = rows[rows.length - 1];
+		  const tip = document.createElement('div');
+		  tip.innerHTML = `
+			<div style="font-weight:bold">
+			  ${this._escapeText(first.LINIE)} | ${this._escapeText(first.FAHRT_ID)}
+			</div>
+			<div>
+			  Fahrzeug: ${this._escapeText(first.FAHRZEUG_NR)} | Betriebstag: ${Utils.formatYyyymmdd(first.BETRIEBSTAG)}
+			</div>
+			<div>
+			  ${this._escapeText(first.HHMMSS)} → ${this._escapeText(last.HHMMSS)}
+			</div>
+			<div>
+			  Saldo: ${this._escapeText(first.SALDO)} → ${this._escapeText(last.SALDO)}
+			</div>
+		  `;
+		  poly.bindTooltip(tip);
+		  this.polylines[jk] = poly;
+		  return poly;
+		});
+		const batchResults = await Promise.all(batchPromises);
+		allPolylines.push(...batchResults.filter(Boolean));
+	  }
 
     // Auto-fit bounds to all polylines
     const allLatLngs = [];
