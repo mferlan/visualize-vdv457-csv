@@ -815,12 +815,7 @@ class TableRenderer {
         } else if (h === 'Anomaly') {
           td.textContent = r.DATA_ANOMALY ?? '';
         } else {
-		  let val = r[h];
-		  if (h === 'BETRIEBSTAG' || h === 'DATUM') {
-			val = Utils.formatYyyymmdd(r[h]);
-		  } else if (h === 'UHRZEIT') {
-			val = r['HHMMSS'];
-		  } else if (h === '-') {
+			if (h === '-') {
 			  const color = processedData.journeyColors ? processedData.journeyColors[r.__JOURNEY_KEY] : Config.COLORS.DEFAULT;
 			  const div = document.createElement('div');
 			  div.style.width = '16px';
@@ -829,10 +824,15 @@ class TableRenderer {
 			  div.style.borderRadius = '50%';
 			  div.style.backgroundColor = color;
 			  td.appendChild(div);
- 		  } else {
+			} else {
+			  let val = r[h];
+			  if (h === 'BETRIEBSTAG' || h === 'DATUM') {
+				val = Utils.formatYyyymmdd(r[h]);
+			  } else if (h === 'UHRZEIT') {
+				val = r['HHMMSS'];
+			  } 
 			  td.textContent = (val !== undefined) ? val : '';
-    	  }
-
+			}
         }
         td.style.whiteSpace = 'nowrap';
         tr.appendChild(td);
